@@ -1,1 +1,3 @@
-[{ "keys": ["super+s"], "command": "save2" }]
+[
+	{ "keys": ["super+s"], "command": "save2" }
+]
