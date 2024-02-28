@@ -1,3 +1,1 @@
-[
-	{ "keys": ["ctrl+s"], "command": "save2" }
-]
+[{ "keys": ["ctrl+s"], "command": "save2" }]
