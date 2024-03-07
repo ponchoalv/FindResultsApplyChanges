@@ -1,11 +1,10 @@
 # coding=utf8
-import sublime, sublime_plugin
-import re, os
+import sublime
+import sublime_plugin
+import re
+import os
 
 debug = False
-
-# Compatability
-ST3 = int(sublime.version()) > 3000
 
 
 class Save2Command(sublime_plugin.WindowCommand):
@@ -42,7 +41,7 @@ class FindResultsApplyChangesCommand(sublime_plugin.TextCommand):
 
             if v.settings().get("FindResultsApplyChanges-possible-corruption", False):
                 sublime.message_dialog(
-                    "Committing twice when new newlines has been inserted will corrupt the file. Skipping commit."
+                    "Committing twice when new newlines has been inserted will corrupt the file"
                 )
                 return
 
@@ -88,9 +87,6 @@ class FindResultsApplyChangesCommand(sublime_plugin.TextCommand):
                     next_region_file = sublime.Region(v.size(), v.size())
                 file_name = re.sub(r"\:$", "", v.substr(region_file).strip())
 
-                if debug:
-                    print(file_name)
-
                 changes[file_name] = {}
 
                 for line in range(len(region_lines)):
@@ -124,9 +120,6 @@ class FindResultsApplyChangesCommand(sublime_plugin.TextCommand):
                         )  # remove 'dots' Ellipsis
                         changes[file_name][line_number] = line_content
 
-            if debug:
-                print(changes)
-
                 # remove footer
             if changes[file_name]:
                 footer_line = max(changes[file_name].keys())
@@ -148,16 +141,12 @@ class FindResultsApplyChangesCommand(sublime_plugin.TextCommand):
                         k = int(k)
                         if content[k] != changes[f][k]:
                             content[k] = changes[f][k]
-                            if debug:
-                                print("Line number: " + str(k + 1))
-                                print("Has new value: " + changes[f][k])
                             if "\n" in changes[f][k]:
                                 v.settings().set(
                                     "FindResultsApplyChanges-possible-corruption", True
                                 )
                             modified = True
                     if modified:
-                        print("Writing new content to file " + f)
                         self.write(f, "\n".join(content))
                         modified_files += 1
             if modified_files:
@@ -172,17 +161,9 @@ class FindResultsApplyChangesCommand(sublime_plugin.TextCommand):
         )
 
     def read(self, filepath):
-        if ST3:
-            with open(filepath, "r", newline=None, encoding="utf8") as f:
-                return f.read()
-        else:
-            with open(filepath, "r") as f:
-                return f.read()
+        with open(filepath, "r", newline=None, encoding="utf8") as f:
+            return f.read()
 
     def write(self, filepath, c):
-        if ST3:
-            with open(filepath, "w+", encoding="utf8", newline="") as f:
-                f.write(str(c))
-        else:
-            with open(filepath, "w+") as f:
-                f.write(str(c))
+        with open(filepath, "w+", encoding="utf8", newline="") as f:
+            f.write(str(c))

@@ -2,71 +2,30 @@
 
 ## Description
 
-Apply any change you made to a "Find Results" buffer back to the files. ie:
-
-- Search for "foo" in a folder.
-- This will open a "Find Results" buffer listing all the files with "foo" in it.
-- Change the instances of "foo" for "bar" or something else...
-- Go to the -> Main menubar -> "Find" -> "Find Results - Apply Changes" or just
-  press CTRL/CMD+S
-- This will write all the changes made back to the files.
-- Will be enabled only if the focused view is the "Find Results" tab.
-
-## Bugs
-
-- Uses regions to allow you do multiline changes, but when inserting new
-  newlines, if you already applied some change, will corrupt files **if you
-  commit more than once**, this because the new newlines will shift the line
-  numbers. Will also 'corrupt' files if you add/remove newlines in other
-  instances of the modified files. eg in another tab. To prevent corruption this
-  packages will alert you and prevent most of these.
-
-## WONTFIX
-
-- Will write/read UTF8 files. If you have a file in another encoding,
-  considering jumping to the U8 world. :)
-- It converts line ending of files to Unix style
-- This package disables the "double-click = open file" in Find Results.
-
-# Find Exclude Patterns
-
-## Description
-
-"Find in Files" command includes a lot of noise from binary files, folders you
-don't want to include in search (caches, generated files, logs, version control,
-external libraries, etc, etc, etc). The current way to exclude these from
-searches... is to manually select the list for every search... ! insane.
-
-When installed, this package will automatically append negative values ("please
-don't search XYZ") to the "where" parameter every time you open the "Find in
-Files" panel.
-
-## Preferences
-
-To edit your preferences just go to: Main menubar -> Preferences -> Settings -
-User.
-
-By default will exclude the following normal Sublime Text preferences:
-"index_exclude_patterns" and "binary_file_patterns".
-
-This package used to have a preference named "find_exclude_patterns", now NO
-longer applies and that preference is ignored.
-
-To exlude a folder, you should add it to the "binary_file_patterns", for example
-to exlude the popular version control systems you can have something like this:
-
-    "binary_file_patterns": [".svn/**", ".git/**", ".hg/**", "CVS/**"]
-
-### Installation
-
-Download or clone the contents of this repository to a folder named exactly as
-the package name into the Packages/ folder of ST.
+Applies any change you made to a "Find Results" buffer back to the files when
+you press `ctrl/cmd+s`.
 
 ## Source-code
 
 https://github.com/titoBouzout/FindResultsApplyChanges
 
-## Forum Thread
+## License
 
-https://forum.sublimetext.com/t/pkg-to-edit-just-there-in-the-find-results-tab-yes/11408
-https://forum.sublimetext.com/t/findexcludepatterns-exclusion-list-for-search-results/15323
+"None are so hopelessly enslaved as those who falsely believe they are free."
+Johann Wolfgang von Goethe
+
+Copyeverything (C) 2014 Tito Bouzout <tito.bouzout@gmail.com>
+
+This license apply to all the files inside this program unless noted different
+for some files or portions of code inside these files.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation. http://www.gnu.org/licenses/gpl.html
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see http://www.gnu.org/licenses/gpl.html
