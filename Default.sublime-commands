@@ -1,0 +1,10 @@
+[
+    {
+        "caption": "Find Results: Import Grep/Ripgrep Results",
+        "command": "grep_results_to_find_results"
+    },
+    {
+        "caption": "Find Results: Apply Changes",
+        "command": "find_results_apply_changes"
+    }
+]
