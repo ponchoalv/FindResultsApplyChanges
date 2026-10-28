@@ -220,6 +220,27 @@ class LiveSearchTests(unittest.TestCase):
         self.assertEqual(session.filtered[0][1], 2)
         popen.assert_not_called()
 
+    def test_native_submit_exports_after_sublime_clears_the_input(self):
+        self.file("a.txt", "old\n")
+        session = self.session()
+        self.search(session, "#old#")
+        submitted = session.query
+        session.input.text = ""
+        plugin.FindResultsApplyChangesEventListener().on_modified(session.input)
+        self.window.on_submit(submitted)
+        self.finish()
+        self.assertTrue(session.closed)
+        self.assertIn("  1: old", self.window.active_view().text)
+
+    def test_deleting_query_clears_results_without_exporting(self):
+        self.file("a.txt", "old\n")
+        session = self.session()
+        self.search(session, "#old#")
+        self.query(session, "")
+        self.finish()
+        self.assertEqual(session.filtered, [])
+        self.assertFalse(session.closed)
+
     def test_invalid_regex_no_matches_and_unclosed_filter_quote(self):
         self.file("a.txt", "old\n")
         session = self.session()

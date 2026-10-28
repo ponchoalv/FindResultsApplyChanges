@@ -200,7 +200,7 @@ class LiveSearch:
 
     def open(self, query):
         self.output, self.input = self.window.create_io_panel(
-            LIVE_PANEL, lambda text: self.export(), unlisted=True
+            LIVE_PANEL, self.submit, unlisted=True
         )
         self.input.settings().set("find_results_live_input", True)
         self.output.settings().set("word_wrap", False)
@@ -338,6 +338,12 @@ class LiveSearch:
             self.close(restore=False)
             self.window.focus_view(view)
 
+    def submit(self, text):
+        # Sublime clears the input before invoking the I/O panel callback.
+        self.input.run_command("select_all")
+        self.input.run_command("insert", {"characters": text})
+        self.export()
+
     def close(self, restore=True):
         if self.closed:
             return
@@ -445,7 +451,13 @@ class FindResultsApplyChangesEventListener(sublime_plugin.EventListener):
         if view.settings().get("find_results_live_input") and view.window():
             session = live_searches.get(view.window().id())
             if session and view == session.input:
-                session.change(view.substr(sublime.Region(0, view.size())))
+                text = view.substr(sublime.Region(0, view.size()))
+                if text:
+                    session.change(text)
+                else:
+                    sublime.set_timeout(
+                        lambda: session.change("") if not session.closed and view.size() == 0 else None
+                    )
 
     def on_window_command(self, window, command, args):
         session = live_searches.get(window.id())
