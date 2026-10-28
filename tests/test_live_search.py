@@ -197,7 +197,7 @@ class LiveSearchTests(unittest.TestCase):
         session.move(1)
         self.assertEqual(len(self.window.previewed), 2)
         self.assertIs(self.window.focused, session.input)
-        self.window.on_submit(session.query)
+        plugin.FindResultsLiveExportCommand(self.window).run()
         results = self.window.active_view()
         self.assertEqual(results.name(), "Find Results")
         self.assertTrue(session.closed)
@@ -350,6 +350,6 @@ class LiveSearchTests(unittest.TestCase):
     def test_live_keys_are_scoped_to_the_search_input(self):
         path = Path(__file__).resolve().parents[1] / "Default.sublime-keymap"
         bindings = json.loads(path.read_text())
-        self.assertEqual({tuple(binding["keys"]) for binding in bindings}, {("up",), ("down",), ("ctrl+enter",), ("escape",)})
+        self.assertEqual({tuple(binding["keys"]) for binding in bindings}, {("enter",), ("up",), ("down",), ("ctrl+enter",), ("escape",)})
         for binding in bindings:
             self.assertEqual(binding["context"], [{"key": "setting.find_results_live_input", "operand": True}])
