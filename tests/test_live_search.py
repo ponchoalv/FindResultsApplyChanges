@@ -186,6 +186,129 @@ class LiveSearchTests(unittest.TestCase):
         self.assertEqual(plugin.filter_live_results(results, "ERROR", str(self.root)), results[:1])
         self.assertEqual(plugin.filter_live_results(results, "error", str(self.root)), results)
 
+    def test_options_preserve_regex_quotes_and_backslashes(self):
+        pattern = r"\bcase\b '.*':"
+        for query in (pattern + " -C2 -g '*.c'", "-C 2 --glob='*.c' -- " + pattern):
+            with self.subTest(query=query):
+                args, before, after = plugin.live_search_args(query)
+                self.assertEqual(args, ["--context=2", "--glob=*.c", "-e", pattern])
+                self.assertEqual((before, after), (2, 2))
+        self.assertEqual(plugin.live_search_args(r"\-literal"), (["-e", "-literal"], 0, 0))
+        self.assertEqual(plugin.live_search_args("-- -literal"), (["-e", "-literal"], 0, 0))
+        args, _, _ = plugin.live_search_args("case -g 'a -- b.c'")
+        self.assertEqual(args, ["--glob=a -- b.c", "-e", "case"])
+
+    def test_context_flags_follow_ripgrep_semantics(self):
+        self.file("src/day20/a.txt", "one\ntwo\nold hit\nfour\nfive\n")
+        self.file("src/day21/b.txt", "one\ntwo\nold other\nfour\nfive\n")
+        for flags, expected in (
+            ("-C2", [1, 2, 3, 4, 5]),
+            ("-A 2", [3, 4, 5]),
+            ("--before-context=2", [1, 2, 3]),
+            ("-B1 -A2", [2, 3, 4, 5]),
+            ("-A1 -C2", [1, 2, 3, 4]),
+            ("--context 2 --before-context=0", [3, 4, 5]),
+        ):
+            with self.subTest(flags=flags):
+                session = self.session()
+                self.search(session, "#old " + flags + "#/day20/")
+                self.assertEqual(session.error, "")
+                self.assertEqual(len(session.results), 2)
+                self.assertEqual(len(session.filtered), 1)
+                self.assertEqual([row[1] for row in session.displayed], expected)
+                self.assertTrue(all("/day20/" in row[0] for row in session.displayed))
+                selected = session.output.substr(session.output.sel()[0])
+                self.assertIn("a.txt:3:old hit", selected)
+                session.close()
+
+    def test_overlapping_context_exports_once_and_context_can_be_edited(self):
+        path = self.file("a.txt", "intro\nold keep one\nold skip\nold keep two\ntail\noutside\n")
+        session = self.session()
+        self.search(session, "#old -C1#keep")
+        self.assertEqual(len(session.filtered), 2)
+        self.assertEqual([row[1] for row in session.displayed], [1, 2, 3, 4, 5])
+        self.assertIn("a.txt-3-old skip", session.output.text)
+        generation, lines = session.generation, session.lines
+        self.query(session, "#old -C1#two")
+        self.assertEqual([row[1] for row in session.displayed], [3, 4, 5])
+        self.assertEqual(session.generation, generation)
+        self.assertIs(session.lines, lines)
+        self.query(session, "#old -C1#keep")
+        session.move(1)
+        self.assertIn("a.txt:4:old keep two", session.output.substr(session.output.sel()[0]))
+        session.export()
+        view = self.window.active_view()
+        self.assertEqual(view.text.count("  3  old skip\n"), 1)
+        self.assertIn("2 matches across 1 files", view.text)
+        view.text = view.text.replace(": old keep", ": new keep").replace("  3  old skip", "  3  new context")
+        plugin.Save2Command(self.window).run()
+        self.assertEqual(path.read_text(), "intro\nnew keep one\nnew context\nnew keep two\ntail\noutside\n")
+        sublime.error_message.assert_not_called()
+
+    def test_search_flags_work_with_case_globs_and_ignored_files(self):
+        kept = self.file("src/a.py", "ERROR [value]\nerror value\nERROR [values]\n")
+        self.file("src/a.txt", "ERROR [value]\n")
+        hidden = self.file(".hidden.py", "ERROR [value]\n")
+        ignored = self.file("ignored.py", "ERROR [value]\n")
+        self.file(".ignore", "ignored.py\n")
+        session = self.session()
+        self.search(session, "#[value] -Fi -g '*.py' --hidden --no-ignore#")
+        self.assertEqual(session.error, "")
+        self.assertEqual({row[0] for row in session.filtered}, {str(kept), str(hidden), str(ignored)})
+        self.assertTrue(all(row[1] == 1 for row in session.filtered))
+
+    def test_explicit_patterns_and_option_values_starting_with_dashes(self):
+        self.file("a.txt", "-literal\nother\n")
+        self.file("patterns", "-literal\n")
+        for query in ("#-e -literal -g '*.txt'#", "#-f patterns -g '*.txt'#", "#-F -- -literal#"):
+            with self.subTest(query=query):
+                session = self.session()
+                self.search(session, query)
+                self.assertEqual(session.error, "")
+                self.assertTrue(session.filtered)
+                self.assertTrue(all(row[2] == "-literal" for row in session.filtered))
+                session.close()
+
+    def test_invalid_or_incompatible_flags_are_reported_before_spawning(self):
+        session = self.session()
+        for flags in ("-C", "-A nope", "-B-1", "-C2 --pre=cat", "-U", "-io", "--replace=x", "--count", "--no-json", "--glob='unclosed"):
+            with self.subTest(flags=flags), patch.object(plugin.subprocess, "Popen") as popen:
+                self.search(session, "#old " + flags + "#")
+                self.assertTrue(session.error)
+                self.assertFalse(session.searching)
+                self.assertEqual(session.filtered, [])
+                session.export()
+                self.assertFalse(session.closed)
+                popen.assert_not_called()
+
+    def test_flags_in_second_section_remain_literal_filters(self):
+        self.file("a.txt", "old -C2\nold other\n")
+        session = self.session()
+        self.search(session, "#old#-C2")
+        self.assertEqual((session.before, session.after), (0, 0))
+        self.assertEqual([row[2] for row in session.displayed], ["old -C2"])
+
+    def test_context_lines_count_towards_search_cap(self):
+        self.file("a.txt", "context\nold\ncontext\n")
+        session = self.session()
+        with patch.object(plugin, "MAX_LIVE_RESULTS", 2):
+            self.search(session, "#old -C100000#")
+            session.export()
+        self.assertTrue(session.truncated)
+        self.assertEqual(len(session.lines), 2)
+        self.assertFalse(session.closed)
+        self.assertIn("truncated", sublime.error_message.call_args.args[0])
+
+    def test_changed_context_line_prevents_export(self):
+        path = self.file("a.txt", "before\nold\nafter\n")
+        session = self.session()
+        self.search(session, "#old -C1#")
+        path.write_text("changed\nold\nafter\n")
+        session.export()
+        self.assertFalse(session.closed)
+        self.assertIn("out of date", sublime.error_message.call_args.args[0])
+        self.assertEqual(path.read_text(), "changed\nold\nafter\n")
+
     def test_real_search_preview_export_edit_and_save(self):
         first = self.file("src/a file.txt", "old keep\nold skip\n")
         second = self.file("b.txt", "old keep\n")

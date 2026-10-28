@@ -29,7 +29,7 @@ def read_file(filepath):
         return source.read()
 
 
-def grep_to_find_results(text, base_dir):
+def grep_to_find_results(text, base_dir, matches=None):
     if not base_dir:
         raise ValueError("Enter the directory where grep was run.")
     base_dir = os.path.abspath(os.path.expanduser(base_dir))
@@ -65,14 +65,17 @@ def grep_to_find_results(text, base_dir):
     if not changes:
         raise ValueError("No grep results to import.")
     blocks = []
+    count = 0
     for filename in sorted(changes):
         blocks.append("\n" + filename + ":\n")
         for number in sorted(changes[filename]):
-            blocks.append("  {0}: {1}\n".format(number, changes[filename][number]))
+            matched = matches is None or (filename, number) in matches
+            count += matched
+            blocks.append("  {0}{1}{2}\n".format(
+                number, ": " if matched else "  ", changes[filename][number]
+            ))
     blocks.append(
-        "\n{0} matches across {1} files\n".format(
-            sum(len(lines) for lines in changes.values()), len(changes)
-        )
+        "\n{0} matches across {1} files\n".format(count, len(changes))
     )
     return "".join(blocks), originals
 
@@ -99,9 +102,9 @@ class GrepResultsToFindResultsCommand(sublime_plugin.WindowCommand):
         else:
             self.import_results(text, base_dir)
 
-    def import_results(self, text, base_dir):
+    def import_results(self, text, base_dir, matches=None):
         try:
-            results, originals = grep_to_find_results(text, base_dir)
+            results, originals = grep_to_find_results(text, base_dir, matches)
         except (OSError, UnicodeError, ValueError) as error:
             sublime.error_message(str(error))
             return
@@ -121,9 +124,81 @@ def split_live_query(text):
     return text, ""
 
 
-def live_result_label(result, directory):
+def live_search_args(query):
+    pattern, options = query, ""
+    first = re.search(r"(^| )-", query)
+    if first:
+        pattern, options = query[:first.start()].rstrip(), query[first.end() - 1:]
+    switches = set((
+        "case-sensitive ignore-case smart-case fixed-strings word-regexp line-regexp "
+        "invert-match crlf no-crlf no-unicode pcre2 no-pcre2 no-pcre2-unicode "
+        "auto-hybrid-regex text no-text mmap no-mmap "
+        "stop-on-nonmatch follow no-follow hidden no-hidden glob-case-insensitive "
+        "ignore-file-case-insensitive no-ignore no-ignore-dot no-ignore-exclude "
+        "no-ignore-files no-ignore-global no-ignore-parent no-ignore-vcs "
+        "no-require-git require-git one-file-system unrestricted no-ignore-messages"
+    ).split())
+    valued = set((
+        "after-context before-context context glob iglob type type-not type-add type-clear "
+        "ignore-file max-depth max-filesize max-count threads engine dfa-size-limit "
+        "regex-size-limit sort sortr regexp file"
+    ).split())
+    short = {
+        "A": "after-context", "B": "before-context", "C": "context", "g": "glob",
+        "i": "ignore-case", "s": "case-sensitive", "S": "smart-case", "F": "fixed-strings",
+        "w": "word-regexp", "x": "line-regexp", "v": "invert-match", "P": "pcre2",
+        "a": "text", "L": "follow", ".": "hidden", "u": "unrestricted",
+        "t": "type", "T": "type-not", "m": "max-count", "j": "threads",
+        "d": "max-depth", "e": "regexp", "f": "file",
+    }
+    args, context = [], {"context": 0}
+    tokens = shlex.shlex(options, posix=True)
+    tokens.whitespace_split, tokens.commenters = True, ""
+    for token in tokens:
+        if token == "--":
+            pattern = " ".join(part for part in (pattern, tokens.instream.read().lstrip()) if part)
+            break
+        elif token.startswith("--"):
+            name, equals, value = token[2:].partition("=")
+            flags = [(name, value if equals else None)]
+        elif token.startswith("-") and len(token) > 1:
+            flags = []
+            for index, char in enumerate(token[1:], 2):
+                name = short.get(char, char)
+                value = (token[index:] or None) if name in valued else None
+                flags.append((name, value))
+                if name in valued:
+                    break
+        else:
+            raise ValueError("Expected a ripgrep option, got {0}. Put the pattern before flags or after --.".format(token))
+        for name, value in flags:
+            if name not in switches and name not in valued:
+                raise ValueError("--{0} is not supported by editable live search.".format(name))
+            if name in valued:
+                if value is None:
+                    value = next(tokens, None)
+                if value is None:
+                    raise ValueError("--{0} needs a value.".format(name))
+                args.append("--{0}={1}".format(name, value))
+                if name in ("context", "before-context", "after-context"):
+                    if not re.match(r"^[0-9]+$", value):
+                        raise ValueError("--{0} needs a non-negative line count.".format(name))
+                    context[name] = int(value)
+            elif value is not None:
+                raise ValueError("--{0} does not take a value.".format(name))
+            else:
+                args.append("--" + name)
+    pattern = re.sub(r"(^| )\\-", r"\1-", pattern)
+    if pattern:
+        args += ["-e", pattern]
+    elif not any(arg.startswith(("--regexp=", "--file=")) for arg in args):
+        raise ValueError("Enter a pattern before the options, or after --.")
+    return args, context.get("before-context", context["context"]), context.get("after-context", context["context"])
+
+
+def live_result_label(result, directory, matched=True):
     filename, number, text = result
-    return "{0}:{1}:{2}".format(os.path.relpath(filename, directory), number, text)
+    return (":" if matched else "-").join((os.path.relpath(filename, directory), str(number), text))
 
 
 def filter_live_results(results, filters, directory):
@@ -143,6 +218,29 @@ def filter_live_results(results, filters, directory):
     return matches
 
 
+def live_context_results(matches, lines, before, after):
+    if not before and not after:
+        return matches
+    ranges = {}
+    for filename, number, _ in sorted(matches):
+        spans = ranges.setdefault(filename, [])
+        start, end = number - before, number + after
+        if spans and start <= spans[-1][1] + 1:
+            spans[-1] = (spans[-1][0], max(end, spans[-1][1]))
+        else:
+            spans.append((start, end))
+    positions, results = {}, []
+    for (filename, number), text in sorted(lines.items()):
+        spans = ranges.get(filename, [])
+        index = positions.get(filename, 0)
+        while index < len(spans) and number > spans[index][1]:
+            index += 1
+        positions[filename] = index
+        if index < len(spans) and number >= spans[index][0]:
+            results.append((filename, number, text))
+    return results
+
+
 def kill_live_process(process):
     if process is not None and process.poll() is None:
         try:
@@ -152,7 +250,7 @@ def kill_live_process(process):
 
 
 def read_live_results(process, directory):
-    results, errors = [], []
+    results, lines, errors = [], {}, []
     truncated = False
     try:
         for raw in process.stdout:
@@ -161,19 +259,22 @@ def read_live_results(process, directory):
             except (ValueError, UnicodeError):
                 errors.append(raw.decode("utf8", "replace").rstrip()[:2000])
                 continue
-            if event.get("type") != "match":
+            if event.get("type") not in ("match", "context"):
                 continue
             data = event["data"]
             filename = data["path"].get("text")
             text = data["lines"].get("text")
             if filename is None or text is None or "\n" in filename or "\r" in filename:
                 raise ValueError("Live search needs UTF-8 files and filenames without newlines.")
-            if len(results) == MAX_LIVE_RESULTS:
+            if len(lines) == MAX_LIVE_RESULTS or len(results) == MAX_LIVE_RESULTS:
                 truncated = True
                 kill_live_process(process)
                 break
             filename = os.path.realpath(os.path.join(directory, filename))
-            results.append((filename, data["line_number"], text.rstrip("\n").rstrip("\r")))
+            number, text = data["line_number"], text.rstrip("\n").rstrip("\r")
+            lines[(filename, number)] = text
+            if event["type"] == "match":
+                results.append((filename, number, text))
     except Exception:
         kill_live_process(process)
         raise
@@ -182,7 +283,7 @@ def read_live_results(process, directory):
         code = process.wait()
     if errors or (code not in (0, 1) and not truncated):
         raise ValueError("\n".join(errors) or "ripgrep exited with status {0}".format(code))
-    return results, truncated
+    return results, lines, truncated
 
 
 class LiveSearch:
@@ -192,6 +293,8 @@ class LiveSearch:
         self.positions = [(view, list(view.sel()), view.viewport_position()) for view in window.views()]
         self.pattern, self.filters, self.query = None, "", ""
         self.results, self.filtered = [], []
+        self.lines, self.displayed = {}, []
+        self.before, self.after = 0, 0
         self.index, self.generation = 0, 0
         self.process, self.preview = None, None
         self.searching, self.truncated, self.closed = False, False, False
@@ -228,6 +331,7 @@ class LiveSearch:
             generation = self.generation
             self.stop_process()
             self.results = []
+            self.lines = {}
             self.error, self.truncated = "", False
             self.searching = bool(pattern)
             if pattern:
@@ -242,12 +346,14 @@ class LiveSearch:
         worker.start()
 
     def search(self, pattern, generation):
-        results, truncated, error = [], False, ""
+        results, lines, truncated, error = [], {}, False, ""
+        before, after = 0, 0
         process = None
         try:
+            args, before, after = live_search_args(pattern)
             process = subprocess.Popen(
                 [self.executable, "--json", "--no-config", "--color", "never",
-                 "--smart-case", "-e", pattern, "--", "."],
+                 "--smart-case"] + args + ["--", "."],
                 cwd=self.directory, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -257,7 +363,7 @@ class LiveSearch:
                     kill_live_process(process)
                 else:
                     self.process = process
-            results, truncated = read_live_results(process, self.directory)
+            results, lines, truncated = read_live_results(process, self.directory)
         except (OSError, UnicodeError, ValueError, KeyError, TypeError) as failure:
             error = str(failure)
         finally:
@@ -269,6 +375,7 @@ class LiveSearch:
             if self.closed or generation != self.generation:
                 return
             self.results, self.truncated, self.error = results, truncated, error
+            self.lines, self.before, self.after = lines, before, after
             self.searching = False
             self.refilter()
 
@@ -280,6 +387,7 @@ class LiveSearch:
             self.filtered = filter_live_results(self.results, self.filters, self.directory)
         except ValueError as error:
             self.filtered, self.filter_error = [], str(error)
+        self.displayed = live_context_results(self.filtered, self.lines, self.before, self.after)
         self.index = 0
         self.render()
         self.show_preview()
@@ -290,19 +398,22 @@ class LiveSearch:
         elif self.searching:
             status = "Searching..."
         elif self.truncated:
-            status = "Search exceeds {0} matches; narrow #pattern before exporting.".format(MAX_LIVE_RESULTS)
+            status = "Search exceeds {0} result lines; narrow #pattern before exporting.".format(MAX_LIVE_RESULTS)
         elif not self.pattern:
             status = "Type #pattern#filters to search."
         else:
             status = "{0} filtered / {1} matches".format(len(self.filtered), len(self.results))
         header = status + "\nUp/Down: preview | Enter or Ctrl+Enter: export all filtered results | Esc: cancel\n\n"
-        labels = [live_result_label(result, self.directory)[:500] for result in self.filtered]
+        matches = set((filename, number) for filename, number, _ in self.filtered)
+        labels = [live_result_label(result, self.directory, result[:2] in matches)[:500]
+                  for result in self.displayed]
         self.output.run_command("find_results_live_render", {"text": header + "\n".join(labels)})
         self.highlight()
 
     def highlight(self):
         if self.filtered:
-            region = self.output.line(self.output.text_point(self.index + 3, 0))
+            row = self.displayed.index(self.filtered[self.index])
+            region = self.output.line(self.output.text_point(row + 3, 0))
             self.output.sel().clear()
             self.output.sel().add(region)
             self.output.show(region)
@@ -332,8 +443,9 @@ class LiveSearch:
         if self.truncated:
             sublime.error_message("Narrow #pattern before exporting: this search was truncated.")
             return
-        text = "\n".join("{0}:{1}:{2}".format(*result) for result in self.filtered)
-        view = GrepResultsToFindResultsCommand(self.window).import_results(text, self.directory)
+        text = "\n".join("{0}:{1}:{2}".format(*result) for result in self.displayed)
+        matches = set((filename, number) for filename, number, _ in self.filtered)
+        view = GrepResultsToFindResultsCommand(self.window).import_results(text, self.directory, matches)
         if view is not None:
             self.close(restore=False)
             self.window.focus_view(view)

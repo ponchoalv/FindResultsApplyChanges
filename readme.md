@@ -28,16 +28,39 @@ Type `#pattern#filters`, for example:
 ```text
 #error#payment !tests
 #user.*name#src "first name"
+#case '.*': -C2#/day20/
+#error -A 3 -B 1 -g '*.py'#payment !tests
+#-i -C2 -- error#src
 ```
 
-The part before the second `#` is a ripgrep regular expression. Changing it
-starts a new search after a short typing delay and cancels the previous one.
+The part before the second `#` contains the ripgrep regular expression and
+options. Put options after the pattern, or put them first and use `--` before
+the pattern. Regex quotes and backslashes are preserved. Escape a literal
+leading dash as `\-`, or put the pattern after `--`.
+
+`-C2` shows two lines of context on both sides; `-A` and `-B` select after/before
+context independently. Attached, separated, and long forms work (`-C2`,
+`-C 2`, `--context=2`). Context stays with each remaining hit after filtering
+and is included in the exported buffer, where it can also be edited.
+
+Search and file-selection options include `-i`, `-s`, `-S`, `-F`, `-w`, `-x`,
+`-v`, `-P`, `-g`, `--iglob`, `-t`, `-T`, `--type-add`, `--type-clear`, `--hidden`,
+`--no-ignore` and its variants, `-u`, `-L`, `--ignore-file`, `--max-depth`,
+`--max-filesize`, `-m`, `-j`, `--engine`, `--sort`, `--sortr`, `-e`, and `-f`.
+Short flags can be combined, and option values use shell-style quoting.
+Output modes such as `--count`, `--files`, `--replace`, and `--only-matching`,
+plus multiline, non-UTF-8 encodings, compressed files, and preprocessors are
+unsupported in editable live search; incompatible options show an error.
+
+Changing the first section starts a new search after a short typing delay
+and cancels the previous one.
 The remaining part filters the existing results immediately, without rerunning
 ripgrep. Space-separated terms must all appear in the path or line text;
 `!term` excludes a term, and quotes group phrases. Both stages use smart case:
 lowercase input ignores case, uppercase input makes matching case-sensitive.
 These filters are literal terms, not Emacs completion styles or fuzzy matching.
-A query without a leading `#` is treated entirely as the ripgrep pattern.
+Flags only affect the first section. A query without a leading `#` is treated
+entirely as the first section, including any options.
 
 - `Up` / `Down`: preview the matching source line while keeping input focus.
 - `Enter` / `Ctrl+Enter`: export **all filtered results** into an editable Find
@@ -46,8 +69,9 @@ A query without a leading `#` is treated entirely as the ripgrep pattern.
 - In the exported tab, use multiple cursors and `Ctrl/Cmd+S` to apply your edits.
 
 Only ripgrep is required; there is no `fzf` dependency. Live searches respect
-ripgrep's default ignore rules. Searches above 10,000 matching lines are marked
-as truncated, and export is blocked until the search pattern is narrowed.
+ripgrep's default ignore rules. Searches above 10,000 result lines (including
+context) are marked as truncated, and export is blocked until the first section
+is narrowed.
 Displayed lines are shortened to 500 characters; exported lines are complete.
 
 ## Native search results
