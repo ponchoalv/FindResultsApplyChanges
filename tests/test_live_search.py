@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -486,10 +487,29 @@ class LiveSearchTests(unittest.TestCase):
         command = plugin.FindResultsLiveSearchCommand(self.window)
         command.run(directory=str(self.root / "missing"))
         self.assertIn("directory does not exist", sublime.error_message.call_args.args[0])
-        with patch.object(plugin.shutil, "which", return_value=None), patch.object(plugin.sys, "platform", "linux"):
-            command.run(directory=str(self.root))
-        self.assertIn("Install ripgrep", sublime.error_message.call_args.args[0])
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform), patch.object(plugin.shutil, "which", return_value=None), patch.object(plugin.sys, "platform", platform):
+                command.run(directory=str(self.root))
+                self.assertIn("Install ripgrep", sublime.error_message.call_args.args[0])
         self.assertEqual(plugin.live_searches, {})
+
+    def test_windows_launch_works_without_newer_python_constants(self):
+        session = self.session()
+        session.executable = r"C:\Program Files\ripgrep\rg.exe"
+        self.query(session, "#old#")
+        legacy = SimpleNamespace(
+            Popen=Mock(return_value=Process(b"")), DEVNULL=plugin.subprocess.DEVNULL,
+            PIPE=plugin.subprocess.PIPE, STDOUT=plugin.subprocess.STDOUT,
+        )
+        with patch.object(plugin.sys, "platform", "win32"), patch.object(plugin, "subprocess", legacy):
+            session.search(session.pattern, session.generation)
+        self.finish()
+        self.assertEqual(session.error, "")
+        self.assertFalse(session.searching)
+        popen = legacy.Popen
+        self.assertEqual(popen.call_args.args[0][0], session.executable)
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x08000000)
+        self.assertNotIn("shell", popen.call_args.kwargs)
 
     def test_live_keys_are_scoped_to_the_search_input(self):
         path = Path(__file__).resolve().parents[1] / "Default.sublime-keymap"

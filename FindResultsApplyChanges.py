@@ -351,12 +351,13 @@ class LiveSearch:
         process = None
         try:
             args, before, after = live_search_args(pattern)
+            # Python 3.3 lacks CREATE_NO_WINDOW; fall back to the Win32 flag value.
             process = subprocess.Popen(
                 [self.executable, "--json", "--no-config", "--color", "never",
                  "--smart-case"] + args + ["--", "."],
                 cwd=self.directory, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0,
             )
             with self.lock:
                 if self.closed or generation != self.generation:
