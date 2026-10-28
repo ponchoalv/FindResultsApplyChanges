@@ -4,8 +4,17 @@ import sublime_plugin
 import re
 import os
 import hashlib
+import json
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
 
 debug = False
+LIVE_PANEL = "find_results_live"
+MAX_LIVE_RESULTS = 10000
+live_searches = {}
 
 
 def is_find_results(view):
@@ -102,6 +111,324 @@ class GrepResultsToFindResultsCommand(sublime_plugin.WindowCommand):
         view.set_scratch(True)
         view.settings().set("FindResultsApplyChanges-originals", originals)
         view.run_command("append", {"characters": results})
+        return view
+
+
+def split_live_query(text):
+    if text.startswith("#"):
+        pattern, _, filters = text[1:].partition("#")
+        return pattern, filters
+    return text, ""
+
+
+def live_result_label(result, directory):
+    filename, number, text = result
+    return "{0}:{1}:{2}".format(os.path.relpath(filename, directory), number, text)
+
+
+def filter_live_results(results, filters, directory):
+    terms = shlex.split(filters)
+    sensitive = filters != filters.lower()
+    if not sensitive:
+        terms = [term.casefold() for term in terms]
+    include = [term for term in terms if not (term.startswith("!") and len(term) > 1)]
+    exclude = [term[1:] for term in terms if term.startswith("!") and len(term) > 1]
+    matches = []
+    for result in results:
+        label = live_result_label(result, directory)
+        if not sensitive:
+            label = label.casefold()
+        if all(term in label for term in include) and not any(term in label for term in exclude):
+            matches.append(result)
+    return matches
+
+
+def kill_live_process(process):
+    if process is not None and process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass  # The previous search may have exited between poll and kill.
+
+
+def read_live_results(process, directory):
+    results, errors = [], []
+    truncated = False
+    try:
+        for raw in process.stdout:
+            try:
+                event = json.loads(raw.decode("utf8"))
+            except (ValueError, UnicodeError):
+                errors.append(raw.decode("utf8", "replace").rstrip()[:2000])
+                continue
+            if event.get("type") != "match":
+                continue
+            data = event["data"]
+            filename = data["path"].get("text")
+            text = data["lines"].get("text")
+            if filename is None or text is None or "\n" in filename or "\r" in filename:
+                raise ValueError("Live search needs UTF-8 files and filenames without newlines.")
+            if len(results) == MAX_LIVE_RESULTS:
+                truncated = True
+                kill_live_process(process)
+                break
+            filename = os.path.realpath(os.path.join(directory, filename))
+            results.append((filename, data["line_number"], text.rstrip("\n").rstrip("\r")))
+    except Exception:
+        kill_live_process(process)
+        raise
+    finally:
+        process.stdout.close()
+        code = process.wait()
+    if errors or (code not in (0, 1) and not truncated):
+        raise ValueError("\n".join(errors) or "ripgrep exited with status {0}".format(code))
+    return results, truncated
+
+
+class LiveSearch:
+    def __init__(self, window, directory, executable):
+        self.window, self.directory, self.executable = window, directory, executable
+        self.origin = window.active_view()
+        self.positions = [(view, list(view.sel()), view.viewport_position()) for view in window.views()]
+        self.pattern, self.filters, self.query = None, "", ""
+        self.results, self.filtered = [], []
+        self.index, self.generation = 0, 0
+        self.process, self.preview = None, None
+        self.searching, self.truncated, self.closed = False, False, False
+        self.error, self.filter_error = "", ""
+        self.lock = threading.Lock()
+
+    def open(self, query):
+        self.output, self.input = self.window.create_io_panel(
+            LIVE_PANEL, lambda text: self.export(), unlisted=True
+        )
+        self.input.settings().set("find_results_live_input", True)
+        self.output.settings().set("word_wrap", False)
+        self.output.settings().set("gutter", False)
+        self.output.set_read_only(True)
+        self.window.run_command("show_panel", {"panel": "output." + LIVE_PANEL})
+        self.window.focus_view(self.input)
+        self.input.run_command("select_all")
+        self.input.run_command("insert", {"characters": query})
+        self.change(query)
+
+    def stop_process(self):
+        with self.lock:
+            process, self.process = self.process, None
+        kill_live_process(process)
+
+    def change(self, query):
+        if self.closed:
+            return
+        self.query = query
+        pattern, self.filters = split_live_query(query)
+        if pattern != self.pattern:
+            self.pattern = pattern
+            self.generation += 1
+            generation = self.generation
+            self.stop_process()
+            self.results = []
+            self.error, self.truncated = "", False
+            self.searching = bool(pattern)
+            if pattern:
+                sublime.set_timeout(lambda: self.start_search(pattern, generation), 200)
+        self.refilter()
+
+    def start_search(self, pattern, generation):
+        if self.closed or self.generation != generation:
+            return
+        worker = threading.Thread(target=self.search, args=(pattern, generation))
+        worker.daemon = True
+        worker.start()
+
+    def search(self, pattern, generation):
+        results, truncated, error = [], False, ""
+        process = None
+        try:
+            process = subprocess.Popen(
+                [self.executable, "--json", "--no-config", "--color", "never",
+                 "--smart-case", "-e", pattern, "--", "."],
+                cwd=self.directory, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            with self.lock:
+                if self.closed or generation != self.generation:
+                    kill_live_process(process)
+                else:
+                    self.process = process
+            results, truncated = read_live_results(process, self.directory)
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError) as failure:
+            error = str(failure)
+        finally:
+            with self.lock:
+                if self.process is process:
+                    self.process = None
+
+        def finish():
+            if self.closed or generation != self.generation:
+                return
+            self.results, self.truncated, self.error = results, truncated, error
+            self.searching = False
+            self.refilter()
+
+        sublime.set_timeout(finish)
+
+    def refilter(self):
+        self.filter_error = ""
+        try:
+            self.filtered = filter_live_results(self.results, self.filters, self.directory)
+        except ValueError as error:
+            self.filtered, self.filter_error = [], str(error)
+        self.index = 0
+        self.render()
+        self.show_preview()
+
+    def render(self):
+        if self.error or self.filter_error:
+            status = self.error or self.filter_error
+        elif self.searching:
+            status = "Searching..."
+        elif self.truncated:
+            status = "Search exceeds {0} matches; narrow #pattern before exporting.".format(MAX_LIVE_RESULTS)
+        elif not self.pattern:
+            status = "Type #pattern#filters to search."
+        else:
+            status = "{0} filtered / {1} matches".format(len(self.filtered), len(self.results))
+        header = status + "\nUp/Down: preview | Enter or Ctrl+Enter: export all filtered results | Esc: cancel\n\n"
+        labels = [live_result_label(result, self.directory)[:500] for result in self.filtered]
+        self.output.run_command("find_results_live_render", {"text": header + "\n".join(labels)})
+        self.highlight()
+
+    def highlight(self):
+        if self.filtered:
+            region = self.output.line(self.output.text_point(self.index + 3, 0))
+            self.output.sel().clear()
+            self.output.sel().add(region)
+            self.output.show(region)
+
+    def show_preview(self):
+        if self.filtered and not self.closed:
+            filename, number, _ = self.filtered[self.index]
+            self.preview = self.window.open_file(
+                "{0}:{1}".format(filename, number), sublime.ENCODED_POSITION | sublime.TRANSIENT
+            )
+            self.window.focus_view(self.input)
+
+    def move(self, step):
+        if self.filtered:
+            self.index = (self.index + step) % len(self.filtered)
+            self.highlight()
+            self.show_preview()
+
+    def export(self):
+        query = self.input.substr(sublime.Region(0, self.input.size()))
+        if query != self.query:
+            self.change(query)
+        if self.searching or self.error or self.filter_error or not self.filtered:
+            sublime.status_message("Wait for a successful search with matching results before exporting.")
+            return
+        # shortcut: large searches are capped; add streaming export if full scans become necessary.
+        if self.truncated:
+            sublime.error_message("Narrow #pattern before exporting: this search was truncated.")
+            return
+        text = "\n".join("{0}:{1}:{2}".format(*result) for result in self.filtered)
+        view = GrepResultsToFindResultsCommand(self.window).import_results(text, self.directory)
+        if view is not None:
+            self.close(restore=False)
+            self.window.focus_view(view)
+
+    def close(self, restore=True):
+        if self.closed:
+            return
+        self.closed = True
+        self.generation += 1
+        self.stop_process()
+        if live_searches.get(self.window.id()) is self:
+            live_searches.pop(self.window.id())
+        if self.window.active_panel() == "output." + LIVE_PANEL:
+            self.window.run_command("hide_panel")
+        if self.preview and self.preview.is_valid() and not self.preview.is_dirty():
+            sheet = self.preview.sheet()
+            if sheet and sheet.is_transient():
+                sheet.close()
+        for view, selections, viewport in self.positions:
+            if view.is_valid():
+                view.sel().clear()
+                view.sel().add_all(selections)
+                view.set_viewport_position(viewport, animate=False)
+        if restore and self.origin and self.origin.is_valid():
+            self.window.focus_view(self.origin)
+
+
+class FindResultsLiveSearchCommand(sublime_plugin.WindowCommand):
+    def run(self, directory=None, query="#"):
+        if not hasattr(self.window, "create_io_panel"):
+            sublime.error_message("Live search requires a Sublime Text 4 build with I/O panels.")
+            return
+        if directory is None:
+            folders = self.window.folders()
+            if len(folders) != 1:
+                view = self.window.active_view()
+                initial = folders[0] if folders else os.path.dirname(view.file_name() or "") if view else ""
+                self.window.show_input_panel(
+                    "Search directory", initial,
+                    lambda path: self.run(directory=path, query=query), None, None
+                )
+                return
+            directory = folders[0]
+        directory = os.path.realpath(os.path.expanduser(directory))
+        if not os.path.isdir(directory):
+            sublime.error_message("Search directory does not exist: " + directory)
+            return
+        executable = shutil.which("rg")
+        if executable is None and sys.platform == "darwin":
+            executable = next((path for path in ("/opt/homebrew/bin/rg", "/usr/local/bin/rg")
+                               if os.path.isfile(path) and os.access(path, os.X_OK)), None)
+        if executable is None:
+            sublime.error_message("Install ripgrep (rg) and make it available on PATH.")
+            return
+        previous = live_searches.get(self.window.id())
+        if previous:
+            previous.close()
+        session = LiveSearch(self.window, directory, executable)
+        live_searches[self.window.id()] = session
+        session.open(query)
+
+
+class FindResultsLiveRenderCommand(sublime_plugin.TextCommand):
+    def run(self, edit, text):
+        self.view.set_read_only(False)
+        try:
+            self.view.replace(edit, sublime.Region(0, self.view.size()), text)
+        finally:
+            self.view.set_read_only(True)
+
+
+class FindResultsLiveMoveCommand(sublime_plugin.WindowCommand):
+    def run(self, step):
+        session = live_searches.get(self.window.id())
+        if session:
+            session.move(step)
+
+
+class FindResultsLiveExportCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        session = live_searches.get(self.window.id())
+        if session:
+            session.export()
+
+
+class FindResultsLiveCancelCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        session = live_searches.get(self.window.id())
+        if session:
+            session.close()
+
+
+def plugin_unloaded():
+    for session in list(live_searches.values()):
+        session.close(restore=False)
 
 
 class Save2Command(sublime_plugin.WindowCommand):
@@ -114,6 +441,25 @@ class Save2Command(sublime_plugin.WindowCommand):
 
 
 class FindResultsApplyChangesEventListener(sublime_plugin.EventListener):
+    def on_modified(self, view):
+        if view.settings().get("find_results_live_input") and view.window():
+            session = live_searches.get(view.window().id())
+            if session and view == session.input:
+                session.change(view.substr(sublime.Region(0, view.size())))
+
+    def on_window_command(self, window, command, args):
+        session = live_searches.get(window.id())
+        if session and (
+            command == "hide_panel"
+            or (command == "show_panel" and (args or {}).get("panel") != "output." + LIVE_PANEL)
+        ):
+            session.close(restore=False)
+
+    def on_pre_close_window(self, window):
+        session = live_searches.get(window.id())
+        if session:
+            session.close(restore=False)
+
     def on_new(self, view):
         sublime.set_timeout(lambda: self.on_new_ugly(view), 0)
 

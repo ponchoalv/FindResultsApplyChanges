@@ -1,5 +1,13 @@
 [
     {
+        "caption": "Find Results: Live Ripgrep",
+        "command": "find_results_live_search"
+    },
+    {
+        "caption": "Find Results: Export Live Results",
+        "command": "find_results_live_export"
+    },
+    {
         "caption": "Find Results: Import Grep/Ripgrep Results",
         "command": "grep_results_to_find_results"
     },

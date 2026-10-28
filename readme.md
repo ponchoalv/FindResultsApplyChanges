@@ -6,7 +6,8 @@ Applies any change you made to a "Find Results" buffer back to the files when
 you press `ctrl/cmd+s`.
 
 This fork fixes Sublime Text 4's `~/...` result paths and adds an importer for
-grep and ripgrep output. Both use the same editable Find Results buffer.
+grep and ripgrep output, plus live search with previews and `#pattern#filter`
+narrowing. All three use the same editable Find Results buffer.
 
 ## Installation
 
@@ -14,6 +15,40 @@ Open `Preferences > Browse Packages...` and clone this fork into a directory
 named `FindResultsApplyChanges` inside the opened Packages directory. Restart
 Sublime Text. Use this fork instead of a second, differently named copy of the
 upstream plugin.
+
+## Live search, preview, and export
+
+Install `ripgrep` (`rg`) and run **Find Results: Live Ripgrep** from the Command
+Palette. The search uses the project folder; if the window has several folders
+or none, it asks for a directory. Live search requires a Sublime Text 4 build
+with I/O panels; native result editing and grep import still work without them.
+
+Type `#pattern#filters`, for example:
+
+```text
+#error#payment !tests
+#user.*name#src "first name"
+```
+
+The part before the second `#` is a ripgrep regular expression. Changing it
+starts a new search after a short typing delay and cancels the previous one.
+The remaining part filters the existing results immediately, without rerunning
+ripgrep. Space-separated terms must all appear in the path or line text;
+`!term` excludes a term, and quotes group phrases. Both stages use smart case:
+lowercase input ignores case, uppercase input makes matching case-sensitive.
+These filters are literal terms, not Emacs completion styles or fuzzy matching.
+A query without a leading `#` is treated entirely as the ripgrep pattern.
+
+- `Up` / `Down`: preview the matching source line while keeping input focus.
+- `Enter` / `Ctrl+Enter`: export **all filtered results** into an editable Find
+  Results tab. **Find Results: Export Live Results** does the same.
+- `Esc`: cancel the search and restore the original editor selection and scroll.
+- In the exported tab, use multiple cursors and `Ctrl/Cmd+S` to apply your edits.
+
+Only ripgrep is required; there is no `fzf` dependency. Live searches respect
+ripgrep's default ignore rules. Searches above 10,000 matching lines are marked
+as truncated, and export is blocked until the search pattern is narrowed.
+Displayed lines are shortened to 500 characters; exported lines are complete.
 
 ## Native search results
 

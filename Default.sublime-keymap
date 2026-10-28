@@ -1,0 +1,24 @@
+[
+    {
+        "keys": ["up"],
+        "command": "find_results_live_move",
+        "args": {"step": -1},
+        "context": [{"key": "setting.find_results_live_input", "operand": true}]
+    },
+    {
+        "keys": ["down"],
+        "command": "find_results_live_move",
+        "args": {"step": 1},
+        "context": [{"key": "setting.find_results_live_input", "operand": true}]
+    },
+    {
+        "keys": ["ctrl+enter"],
+        "command": "find_results_live_export",
+        "context": [{"key": "setting.find_results_live_input", "operand": true}]
+    },
+    {
+        "keys": ["escape"],
+        "command": "find_results_live_cancel",
+        "context": [{"key": "setting.find_results_live_input", "operand": true}]
+    }
+]
