@@ -324,7 +324,7 @@ class FindResultsTests(unittest.TestCase):
         commands = json.loads((root / "Default.sublime-commands").read_text())
         self.assertEqual({entry["command"] for entry in commands}, {
             "grep_results_to_find_results", "find_results_apply_changes",
-            "find_results_live_search", "find_results_live_export",
+            "find_results_live_search", "find_results_live_sublime", "find_results_live_export",
         })
         for platform in ("OSX", "Linux", "Windows"):
             binding = json.loads((root / ("Default (%s).sublime-keymap" % platform)).read_text())

@@ -7,7 +7,8 @@ you press `ctrl/cmd+s`.
 
 This fork fixes Sublime Text 4's `~/...` result paths and adds an importer for
 grep and ripgrep output, plus live search with previews and `#pattern#filter`
-narrowing. All three use the same editable Find Results buffer.
+narrowing using either Sublime's search API or ripgrep. All use the same
+editable Find Results buffer.
 
 ## Installation
 
@@ -18,8 +19,13 @@ upstream plugin.
 
 ## Live search, preview, and export
 
-Install `ripgrep` (`rg`) and run **Find Results: Live Ripgrep** from the Command
-Palette. The search uses the project folder; if the window has several folders
+Run either command from the Command Palette:
+
+- **Find Results: Live Sublime** uses Sublime's native buffer search API and
+  needs no external executable.
+- **Find Results: Live Ripgrep** uses `ripgrep` (`rg`), which must be installed.
+
+The search uses the project folder; if the window has several folders
 or none, it asks for a directory. Live search requires a Sublime Text 4 build
 with I/O panels; native result editing and grep import still work without them.
 
@@ -33,7 +39,7 @@ Type `#pattern#filters`, for example:
 #-i -C2 -- error#src
 ```
 
-The part before the second `#` contains the ripgrep regular expression and
+The part before the second `#` contains the selected engine's regular expression and
 options. Put options after the pattern, or put them first and use `--` before
 the pattern. Regex quotes and backslashes are preserved. Escape a literal
 leading dash as `\-`, or put the pattern after `--`.
@@ -43,19 +49,24 @@ context independently. Attached, separated, and long forms work (`-C2`,
 `-C 2`, `--context=2`). Context stays with each remaining hit after filtering
 and is included in the exported buffer, where it can also be edited.
 
-Search and file-selection options include `-i`, `-s`, `-S`, `-F`, `-w`, `-x`,
+Live Sublime supports `-i`, `-s`, `-S`, `-F`, `-w`, `-g`, and `-A`/`-B`/`-C`
+(including their long forms). Other options show an error suggesting Live
+Ripgrep. Its `-g` patterns use shell-style filename/path globs, with `!` for
+exclusions.
+
+Live Ripgrep search and file-selection options include `-i`, `-s`, `-S`, `-F`, `-w`, `-x`,
 `-v`, `-P`, `-g`, `--iglob`, `-t`, `-T`, `--type-add`, `--type-clear`, `--hidden`,
 `--no-ignore` and its variants, `-u`, `-L`, `--ignore-file`, `--max-depth`,
 `--max-filesize`, `-m`, `-j`, `--engine`, `--sort`, `--sortr`, `-e`, and `-f`.
 Short flags can be combined, and option values use shell-style quoting.
 Output modes such as `--count`, `--files`, `--replace`, and `--only-matching`,
 plus multiline, non-UTF-8 encodings, compressed files, and preprocessors are
-unsupported in editable live search; incompatible options show an error.
+unsupported in editable live ripgrep search; incompatible options show an error.
 
 Changing the first section starts a new search after a short typing delay
 and cancels the previous one.
 The remaining part filters the existing results immediately, without rerunning
-ripgrep. Space-separated terms must all appear in the path or line text;
+the search. Space-separated terms must all appear in the path or line text;
 `!term` excludes a term, and quotes group phrases. Both stages use smart case:
 lowercase input ignores case, uppercase input makes matching case-sensitive.
 These filters are literal terms, not Emacs completion styles or fuzzy matching.
@@ -68,11 +79,20 @@ entirely as the first section, including any options.
 - `Esc`: cancel the search and restore the original editor selection and scroll.
 - In the exported tab, use multiple cursors and `Ctrl/Cmd+S` to apply your edits.
 
-Only ripgrep is required; there is no `fzf` dependency. Live searches respect
-ripgrep's default ignore rules. Searches above 10,000 result lines (including
+There is no `fzf` dependency. Live Ripgrep respects ripgrep's default ignore
+rules. Searches above 10,000 result lines (including
 context) are marked as truncated, and export is blocked until the first section
 is narrowed.
 Displayed lines are shortened to 500 characters; exported lines are complete.
+
+Live Sublime scans saved UTF-8 files and uses a hidden buffer for native
+matching; it does not invoke the Find in Files panel. It applies global and
+project folder include/exclude patterns, binary patterns, and index excludes.
+It does not interpret `.gitignore` or descend into directory symlinks. Binary,
+non-UTF-8, unreadable files, and files larger than 10 MiB are skipped, with a
+count shown in the results panel. Sublime's search API reports invalid regexes
+as no matches; Live Ripgrep provides regex error messages. Native scanning may
+be slower than ripgrep on large folders.
 
 ## Native search results
 

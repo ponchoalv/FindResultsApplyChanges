@@ -1,5 +1,9 @@
 [
     {
+        "caption": "Find Results: Live Sublime",
+        "command": "find_results_live_sublime"
+    },
+    {
         "caption": "Find Results: Live Ripgrep",
         "command": "find_results_live_search"
     },

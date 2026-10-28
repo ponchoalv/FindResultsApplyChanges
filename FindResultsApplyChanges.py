@@ -10,10 +10,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import fnmatch
 
 debug = False
 LIVE_PANEL = "find_results_live"
 MAX_LIVE_RESULTS = 10000
+MAX_SUBLIME_FILE_BYTES = 10 * 1024 * 1024
 live_searches = {}
 
 
@@ -201,6 +203,84 @@ def live_result_label(result, directory, matched=True):
     return (":" if matched else "-").join((os.path.relpath(filename, directory), str(number), text))
 
 
+def sublime_search_args(query):
+    args, before, after = live_search_args(query)
+    pattern, globs, flags, case = "", [], 0, "smart-case"
+    args = iter(args)
+    for arg in args:
+        name, _, value = arg.partition("=")
+        if arg == "-e":
+            pattern = next(args)
+        elif name in ("--context", "--before-context", "--after-context"):
+            continue
+        elif name in ("--ignore-case", "--case-sensitive", "--smart-case"):
+            case = name[2:]
+        elif name == "--fixed-strings":
+            flags |= sublime.LITERAL
+        elif name == "--word-regexp":
+            flags |= sublime.WHOLEWORD
+        elif name == "--glob":
+            globs.append(value)
+        else:
+            raise ValueError("{0} is not supported by Live Sublime. Use Live Ripgrep for this option.".format(name))
+    if not pattern:
+        raise ValueError("Enter a pattern before the options, or after --.")
+    if case == "ignore-case" or (case == "smart-case" and pattern == pattern.lower()):
+        flags |= sublime.IGNORECASE
+    return pattern, flags, globs, before, after
+
+
+def sublime_path_matches(path, patterns, directory):
+    path = path.replace("\\", "/")
+    relative = os.path.relpath(path, directory).replace("\\", "/")
+    for pattern in patterns:
+        pattern = pattern.replace("\\", "/")
+        if "/" not in pattern:
+            target, prefix, suffix = path.rsplit("/", 1)[-1], "^", "$"
+        elif pattern.startswith("//"):
+            target, prefix, suffix = relative, "^", ""
+            pattern = pattern[2:]
+        else:
+            target, prefix, suffix = path, "^" if os.path.isabs(pattern) else r"(?:^|/)", ""
+        if pattern.endswith("/"):
+            pattern, suffix = pattern.rstrip("/"), r"(?:/|$)"
+        expression = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+        if re.search(prefix + expression + suffix, target, re.I if sys.platform == "win32" else 0):
+            return True
+    return False
+
+
+def sublime_search_files(window, directory):
+    preferences = sublime.load_settings("Preferences.sublime-settings")
+    project = window.project_data() or {}
+    settings, folder, folder_root = project.get("settings", {}), {}, directory
+    project_root = os.path.dirname(window.project_file_name() or os.path.join(directory, "project"))
+    for entry in project.get("folders", []):
+        root = os.path.realpath(os.path.join(project_root, os.path.expanduser(entry["path"])))
+        target, candidate = os.path.normcase(directory), os.path.normcase(root)
+        if (target == candidate or target.startswith(candidate + os.sep)) and len(root) >= len(folder_root if folder else ""):
+            folder, folder_root = entry, root
+    patterns = {}
+    for key in ("folder_include_patterns", "folder_exclude_patterns", "file_include_patterns",
+                "file_exclude_patterns", "binary_file_patterns", "index_exclude_patterns"):
+        defaults = settings.get(key, preferences.get(key, []))
+        patterns[key] = list(folder.get(key, defaults) if "include" in key
+                             else defaults + folder.get(key, []))
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = sorted(name for name in dirs if not sublime_path_matches(
+            os.path.join(root, name), patterns["folder_exclude_patterns"], folder_root
+        ) and (not patterns["folder_include_patterns"] or sublime_path_matches(
+            os.path.join(root, name), patterns["folder_include_patterns"], folder_root
+        )))
+        excluded = patterns["file_exclude_patterns"] + patterns["binary_file_patterns"] + patterns["index_exclude_patterns"]
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            if not sublime_path_matches(path, excluded, folder_root) and (
+                not patterns["file_include_patterns"] or sublime_path_matches(path, patterns["file_include_patterns"], folder_root)
+            ):
+                yield path
+
+
 def filter_live_results(results, filters, directory):
     terms = shlex.split(filters)
     sensitive = filters != filters.lower()
@@ -289,8 +369,6 @@ def read_live_results(process, directory):
 class LiveSearch:
     def __init__(self, window, directory, executable):
         self.window, self.directory, self.executable = window, directory, executable
-        self.origin = window.active_view()
-        self.positions = [(view, list(view.sel()), view.viewport_position()) for view in window.views()]
         self.pattern, self.filters, self.query = None, "", ""
         self.results, self.filtered = [], []
         self.lines, self.displayed = {}, []
@@ -299,9 +377,12 @@ class LiveSearch:
         self.process, self.preview = None, None
         self.searching, self.truncated, self.closed = False, False, False
         self.error, self.filter_error = "", ""
+        self.skipped = 0
         self.lock = threading.Lock()
 
     def open(self, query):
+        self.origin = self.window.active_view()
+        self.positions = [(view, list(view.sel()), view.viewport_position()) for view in self.window.views()]
         self.output, self.input = self.window.create_io_panel(
             LIVE_PANEL, self.submit, unlisted=True
         )
@@ -333,6 +414,7 @@ class LiveSearch:
             self.results = []
             self.lines = {}
             self.error, self.truncated = "", False
+            self.skipped = 0
             self.searching = bool(pattern)
             if pattern:
                 sublime.set_timeout(lambda: self.start_search(pattern, generation), 200)
@@ -404,6 +486,8 @@ class LiveSearch:
             status = "Type #pattern#filters to search."
         else:
             status = "{0} filtered / {1} matches".format(len(self.filtered), len(self.results))
+        if self.skipped:
+            status += " | {0} unreadable, binary, non-UTF-8 or oversized files skipped".format(self.skipped)
         header = status + "\nUp/Down: preview | Enter or Ctrl+Enter: export all filtered results | Esc: cancel\n\n"
         matches = set((filename, number) for filename, number, _ in self.filtered)
         labels = [live_result_label(result, self.directory, result[:2] in matches)[:500]
@@ -480,6 +564,97 @@ class LiveSearch:
             self.window.focus_view(self.origin)
 
 
+class SublimeLiveSearch(LiveSearch):
+    def search(self, query, generation):
+        results, lines, truncated, error, skipped = [], {}, False, "", 0
+        before, after, scanner = 0, 0, None
+        panel = "find_results_native_{0}_{1}".format(id(self), generation)
+        try:
+            pattern, flags, globs, before, after = sublime_search_args(query)
+            if self.closed or generation != self.generation:
+                return
+            scanner = self.window.create_output_panel(panel, unlisted=True)
+            scanner.settings().set("syntax", "Packages/Text/Plain text.tmLanguage")
+            scanner.settings().set("is_widget", True)
+            include = [glob for glob in globs if not glob.startswith("!")]
+            exclude = [glob[1:] for glob in globs if glob.startswith("!")]
+            seen = set()
+            for path in sublime_search_files(self.window, self.directory):
+                if self.closed or generation != self.generation:
+                    return
+                relative = os.path.relpath(path, self.directory).replace("\\", "/")
+                if (include and not any(fnmatch.fnmatchcase(relative if "/" in glob else os.path.basename(path), glob)
+                                        for glob in include)) or any(
+                    fnmatch.fnmatchcase(relative if "/" in glob else os.path.basename(path), glob) for glob in exclude
+                ):
+                    continue
+                filename = os.path.realpath(path)
+                if filename in seen or "\n" in filename or "\r" in filename:
+                    continue
+                seen.add(filename)
+                try:
+                    with open(path, "rb") as source:
+                        raw = source.read(MAX_SUBLIME_FILE_BYTES + 1)
+                    if len(raw) > MAX_SUBLIME_FILE_BYTES or b"\0" in raw:
+                        skipped += 1
+                        continue
+                    text = raw.decode("utf8").replace("\r\n", "\n")
+                except (OSError, UnicodeError):
+                    skipped += 1
+                    continue
+                if not text:
+                    continue
+                scanner.run_command("find_results_live_render", {"text": text})
+                contents, point = text.split("\n"), 0
+                if text.endswith("\n"):
+                    contents.pop()
+                while point <= scanner.size():
+                    if self.closed or generation != self.generation:
+                        return
+                    # shortcut: invalid regexes look like no matches; add diagnostics if Sublime exposes validation.
+                    match = scanner.find(pattern, point, flags)
+                    if match.a < 0:
+                        break
+                    first = scanner.rowcol(match.a)[0]
+                    last = scanner.rowcol(max(match.a, match.b - 1))[0]
+                    if first >= len(contents):
+                        break
+                    last = min(last, len(contents) - 1)
+                    for row in range(max(0, first - before), min(len(contents), last + after + 1)):
+                        if (filename, row + 1) not in lines and len(lines) == MAX_LIVE_RESULTS:
+                            truncated = True
+                            break
+                        lines[(filename, row + 1)] = contents[row].rstrip("\r")
+                    for row in range(first, last + 1):
+                        if (filename, row + 1) not in lines or len(results) == MAX_LIVE_RESULTS:
+                            truncated = True
+                            break
+                        results.append((filename, row + 1, contents[row].rstrip("\r")))
+                    if truncated:
+                        break
+                    # Results represent whole lines; skip other matches on the same line.
+                    point = scanner.full_line(max(match.a, match.b - 1)).b
+                    if point <= match.a or point >= scanner.size():
+                        break
+                if truncated:
+                    break
+        except (OSError, UnicodeError, ValueError, RuntimeError) as failure:
+            error = str(failure)
+        finally:
+            if scanner is not None:
+                self.window.destroy_output_panel(panel)
+
+        def finish():
+            if self.closed or generation != self.generation:
+                return
+            self.results, self.lines, self.truncated, self.error = results, lines, truncated, error
+            self.before, self.after, self.skipped = before, after, skipped
+            self.searching = False
+            self.refilter()
+
+        sublime.set_timeout(finish)
+
+
 class FindResultsLiveSearchCommand(sublime_plugin.WindowCommand):
     def run(self, directory=None, query="#"):
         if not hasattr(self.window, "create_io_panel"):
@@ -500,6 +675,16 @@ class FindResultsLiveSearchCommand(sublime_plugin.WindowCommand):
         if not os.path.isdir(directory):
             sublime.error_message("Search directory does not exist: " + directory)
             return
+        session = self.create_session(directory)
+        if session is None:
+            return
+        previous = live_searches.get(self.window.id())
+        if previous:
+            previous.close()
+        live_searches[self.window.id()] = session
+        session.open(query)
+
+    def create_session(self, directory):
         executable = shutil.which("rg")
         if executable is None and sys.platform == "darwin":
             executable = next((path for path in ("/opt/homebrew/bin/rg", "/usr/local/bin/rg")
@@ -507,12 +692,12 @@ class FindResultsLiveSearchCommand(sublime_plugin.WindowCommand):
         if executable is None:
             sublime.error_message("Install ripgrep (rg) and make it available on PATH.")
             return
-        previous = live_searches.get(self.window.id())
-        if previous:
-            previous.close()
-        session = LiveSearch(self.window, directory, executable)
-        live_searches[self.window.id()] = session
-        session.open(query)
+        return LiveSearch(self.window, directory, executable)
+
+
+class FindResultsLiveSublimeCommand(FindResultsLiveSearchCommand):
+    def create_session(self, directory):
+        return SublimeLiveSearch(self.window, directory, None)
 
 
 class FindResultsLiveRenderCommand(sublime_plugin.TextCommand):

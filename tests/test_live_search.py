@@ -1,6 +1,7 @@
 import io
 import json
 from pathlib import Path
+import re
 import shutil
 import tempfile
 from types import SimpleNamespace
@@ -56,6 +57,24 @@ class LiveView(View):
         end = self.text.find("\n", point)
         return Region(start, len(self.text) if end < 0 else end)
 
+    def full_line(self, point):
+        region = self.line(point)
+        return Region(region.a, min(region.b + 1, self.size()))
+
+    def rowcol(self, point):
+        return self.text.count("\n", 0, point), point - self.text.rfind("\n", 0, point) - 1
+
+    def find(self, pattern, point, flags=0):
+        if flags & sublime.LITERAL:
+            pattern = re.escape(pattern)
+        if flags & sublime.WHOLEWORD:
+            pattern = r"\b(?:" + pattern + r")\b"
+        try:
+            match = re.compile(pattern, re.MULTILINE | (re.I if flags & sublime.IGNORECASE else 0)).search(self.text, point)
+        except re.error:
+            return Region(-1, -1)
+        return Region(*match.span()) if match else Region(-1, -1)
+
     def show(self, region):
         self.visible = region
 
@@ -79,6 +98,7 @@ class LiveWindow(Window):
         super().__init__(directory)
         self.panel, self.focused = None, None
         self.previewed = []
+        self.output_panels, self.project = {}, None
 
     def id(self):
         return id(self)
@@ -87,6 +107,19 @@ class LiveWindow(Window):
         self.on_submit = on_input
         self.output, self.input = LiveView(self), LiveView(self)
         return self.output, self.input
+
+    def create_output_panel(self, name, unlisted=False):
+        self.output_panels[name] = LiveView(self)
+        return self.output_panels[name]
+
+    def destroy_output_panel(self, name):
+        self.output_panels.pop(name).valid = False
+
+    def project_data(self):
+        return self.project
+
+    def project_file_name(self):
+        return str(self.directory / "test.sublime-project")
 
     def new_file(self):
         self.current = LiveView(self)
@@ -139,6 +172,11 @@ class LiveSearchTests(unittest.TestCase):
             mock.reset_mock()
         sublime.windows.return_value = [self.window]
         sublime.ENCODED_POSITION, sublime.TRANSIENT = 1, 4
+        sublime.LITERAL, sublime.IGNORECASE, sublime.WHOLEWORD = 1, 2, 4
+        self.preferences = View()
+        settings = patch.object(sublime, "load_settings", return_value=self.preferences, create=True)
+        settings.start()
+        self.addCleanup(settings.stop)
         plugin.live_searches.clear()
         self.callbacks = []
         timeout = patch.object(sublime, "set_timeout", self.schedule)
@@ -161,8 +199,9 @@ class LiveSearchTests(unittest.TestCase):
             if delay == 0:
                 callback()
 
-    def session(self, query="#"):
-        session = plugin.LiveSearch(self.window, str(self.root), shutil.which("rg"))
+    def session(self, query="#", native=False):
+        session = (plugin.SublimeLiveSearch(self.window, str(self.root), None) if native
+                   else plugin.LiveSearch(self.window, str(self.root), shutil.which("rg")))
         plugin.live_searches[self.window.id()] = session
         session.open(query)
         return session
@@ -331,6 +370,172 @@ class LiveSearchTests(unittest.TestCase):
         self.assertEqual(first.read_text(), "new keep\nold skip\n")
         self.assertEqual(second.read_text(), "new keep\n")
         sublime.error_message.assert_not_called()
+
+    def test_native_search_context_filter_export_and_save_without_rg(self):
+        first = self.file("src/day20/a.c", "// before\ncase '^': old();\n// between\ncase 'N': old();\n// after\n")
+        other = self.file("src/day21/a.c", "case 'N': old();\n")
+        session = self.session(native=True)
+        with patch.object(plugin.subprocess, "Popen", side_effect=AssertionError("Native search must not run rg")):
+            self.search(session, "#case '.*': -C1#/day20/")
+        self.assertEqual(session.error, "")
+        self.assertEqual(len(session.results), 3)
+        self.assertEqual(len(session.filtered), 2)
+        self.assertEqual([row[1] for row in session.displayed], [1, 2, 3, 4, 5])
+        self.assertEqual(self.window.output_panels, {})
+        session.move(1)
+        self.assertIs(self.window.focused, session.input)
+        session.export()
+        view = self.window.active_view()
+        self.assertIn("2 matches across 1 files", view.text)
+        view.text = view.text.replace("old()", "new()").replace("// between", "// edited context")
+        plugin.Save2Command(self.window).run()
+        self.assertEqual(first.read_text(), "// before\ncase '^': new();\n// edited context\ncase 'N': new();\n// after\n")
+        self.assertEqual(other.read_text(), "case 'N': old();\n")
+        sublime.error_message.assert_not_called()
+
+    def test_native_case_literal_word_and_glob_options(self):
+        self.file("a.py", "VALUE [x]\nvalue [x]\nvalues [x]\n")
+        self.file("a.txt", "VALUE [x]\n")
+        session = self.session(native=True)
+        for query, expected in (
+            ("#[x] -F -s -g '*.py'#", [1, 2, 3]),
+            ("#VALUE -w -g '*.py'#", [1]),
+            ("#VALUE -iw -g '*.py'#", [1, 2]),
+            ("#value -w -g '*.py'#", [1, 2]),
+            ("#value -sw -g '*.py'#", [2]),
+        ):
+            with self.subTest(query=query):
+                self.search(session, query)
+                self.assertEqual(session.error, "")
+                self.assertEqual([row[1] for row in session.filtered], expected)
+
+    def test_native_file_selection_uses_preferences_and_project_patterns(self):
+        kept = self.file("src/keep.py", "old\n")
+        for name in (".git/secret.py", "build/skip.py", "vendor/skip.py", "src/skip.log",
+                     "src/image.png", "src/bundle.min.js", "src/generated.py", "src/no.txt"):
+            self.file(name, "old\n")
+        self.preferences.set("folder_exclude_patterns", [".git", "build"])
+        self.preferences.set("file_exclude_patterns", ["*.log"])
+        self.preferences.set("binary_file_patterns", ["*.png"])
+        self.preferences.set("index_exclude_patterns", ["*.min.js"])
+        self.window.project = {"folders": [{
+            "path": ".", "folder_exclude_patterns": ["//vendor/"],
+            "file_exclude_patterns": ["generated.py"], "file_include_patterns": ["*.py"],
+        }]}
+        self.assertEqual(list(plugin.sublime_search_files(self.window, str(self.root))), [str(kept)])
+        self.assertEqual(list(plugin.sublime_search_files(self.window, str(self.root / "src"))), [str(kept)])
+
+    def test_native_sublime_path_patterns(self):
+        root = str(self.root)
+        yes = plugin.sublime_path_matches
+        self.assertTrue(yes(root + "/src/test.py", ["*.py"], root))
+        self.assertTrue(yes(root + "/src/sub/a.py", ["//src/"], root))
+        self.assertFalse(yes(root + "/nested/src/a.py", ["//src/"], root))
+        self.assertFalse(yes(root + "/src_sub/a.py", ["//src/"], root))
+        self.assertFalse(yes(root + "/a1.py", ["a[12].py"], root))
+        self.assertTrue(yes(root + "/nested/src/a.py", ["src/a.py"], root))
+
+    def test_native_suffix_filter_reuses_matches_and_context(self):
+        self.file("a.txt", "old first\ncontext\nold second\n")
+        session = self.session(native=True)
+        self.search(session, "#old -C1#first")
+        generation, lines = session.generation, session.lines
+        with patch.object(self.window, "create_output_panel") as scanner:
+            self.query(session, "#old -C1#second")
+        scanner.assert_not_called()
+        self.assertEqual(session.generation, generation)
+        self.assertIs(session.lines, lines)
+        self.assertEqual([row[1] for row in session.displayed], [2, 3])
+
+    def test_native_zero_width_patterns_and_repeated_hits_do_not_duplicate_lines(self):
+        self.file("a.txt", "old old\nother\n")
+        session = self.session(native=True)
+        for query, numbers in (("#old#", [1]), ("#^#", [1, 2]), ("#$#", [1, 2]), ("#old|$#", [1, 2])):
+            with self.subTest(query=query):
+                self.search(session, query)
+                self.assertEqual([row[1] for row in session.results], numbers)
+                self.assertEqual(self.window.output_panels, {})
+
+    def test_native_skips_binary_invalid_utf8_and_oversized_files(self):
+        self.file("a.txt", "old\n")
+        self.file("binary.txt", "old\0\n")
+        self.file("large.txt", "old" * 20)
+        (self.root / "bad.txt").write_bytes(b"old\xff\n")
+        session = self.session(native=True)
+        with patch.object(plugin, "MAX_SUBLIME_FILE_BYTES", 10):
+            self.search(session, "#old#")
+        self.assertEqual(len(session.results), 1)
+        self.assertEqual(session.skipped, 3)
+        self.assertIn("3 unreadable", session.output.text)
+
+    def test_native_context_cap_cannot_export_partial_or_missing_hits(self):
+        self.file("a.txt", "before\ncontext\nold\nafter\n")
+        session = self.session(native=True)
+        with patch.object(plugin, "MAX_LIVE_RESULTS", 2):
+            self.search(session, "#old -C100000#")
+        self.assertTrue(session.truncated)
+        self.assertEqual(session.filtered, [])
+        self.assertIn("exceeds", session.output.text)
+        self.assertEqual(len(session.lines), 2)
+        session.export()
+        self.assertFalse(session.closed)
+
+    def test_native_changed_source_blocks_export_and_crlf_is_preserved(self):
+        path = self.file("a.txt", "old\r\ncontext\r\n")
+        session = self.session(native=True)
+        self.search(session, "#old -A1#")
+        path.write_bytes(b"old\r\nexternal\r\n")
+        session.export()
+        self.assertFalse(session.closed)
+        self.assertIn("out of date", sublime.error_message.call_args.args[0])
+        self.search(session, "#old -C1#")
+        session.export()
+        view = self.window.active_view()
+        view.text = view.text.replace(": old", ": new")
+        plugin.Save2Command(self.window).run()
+        self.assertEqual(path.read_bytes(), b"new\r\nexternal\r\n")
+
+    def test_native_cancel_during_scan_discards_results_and_removes_hidden_panel(self):
+        self.file("a.txt", "old\n")
+        session = self.session(native=True)
+        original_find = LiveView.find
+
+        def cancel(view, *args):
+            session.close()
+            return original_find(view, *args)
+
+        with patch.object(LiveView, "find", cancel):
+            self.search(session, "#old#")
+        self.assertTrue(session.closed)
+        self.assertEqual(session.results, [])
+        self.assertEqual(self.window.output_panels, {})
+
+    def test_native_invalid_regex_and_no_matches_leave_nothing_to_export(self):
+        self.file("a.txt", "old\n")
+        session = self.session(native=True)
+        for query in ("#(#", "#missing#"):
+            self.search(session, query)
+            self.assertEqual(session.results, [])
+            self.assertFalse(session.searching)
+            self.assertEqual(self.window.output_panels, {})
+            session.export()
+            self.assertFalse(session.closed)
+
+    def test_native_command_needs_no_executable_and_switches_from_rg(self):
+        self.file("a.txt", "old\n")
+        previous = self.session()
+        origin = previous.origin
+        self.search(previous, "#old#")
+        with patch.object(plugin.shutil, "which", side_effect=AssertionError("Native search must not look for rg")):
+            plugin.FindResultsLiveSublimeCommand(self.window).run(directory=str(self.root))
+        self.assertTrue(previous.closed)
+        session = plugin.live_searches[self.window.id()]
+        self.assertIsInstance(session, plugin.SublimeLiveSearch)
+        self.assertIs(session.origin, origin)
+        for query in ("#old -P#", "#old -t py#", "#old --no-ignore#"):
+            self.search(session, query)
+            self.assertIn("Live Ripgrep", session.error)
+            self.assertEqual(session.filtered, [])
 
     def test_filters_reuse_results_without_starting_another_process(self):
         self.file("a.txt", "old first\nold second\n")
